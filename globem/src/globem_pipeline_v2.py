@@ -1,10 +1,27 @@
+
 """
 globem_pipeline_v2.py
-─────────────────────
-기존 대비 변경사항:
-  ① 전체 중앙값 대체 → person-level imputation (개인별 과거 이력 기반)
-  ② 결측 여부 이진 플래그 피처 추가 (착용 안 한 것도 신호로 활용)
+=====================
+Depression prediction pipeline using the GLOBEM dataset.
+
+Key changes from v1
+-------------------
+① Global median imputation → Person-level median imputation
+② Binary missing-indicator features added (non-wear as a signal)
+③ IS/IV circadian proxies restored (computed from segment step counts)
+
+Results
+-------
+v1 AUC : 0.5583
+v2 AUC : 0.5574
+
+Requirements
+------------
+    pip install pandas numpy scikit-learn xgboost bayesian-optimization shap matplotlib
 """
+
+import warnings
+warnings.filterwarnings("ignore")
 
 import pandas as pd
 import numpy as np
@@ -16,28 +33,33 @@ from xgboost import XGBClassifier
 from bayes_opt import BayesianOptimization
 import shap
 import matplotlib.pyplot as plt
-import warnings
-warnings.filterwarnings('ignore')
+from matplotlib.patches import Patch
 
-# ── 경로 설정 ──────────────────────────────────────────────────
-BASE = Path("/Users/hongseungmin/Desktop/Lab/Circadian/GlobeM구현본/globem-dataset-multi-year-datasets-for-longitudinal-human-behavior-modeling-generalization-1.1")
+# =============================================================================
+# Configuration
+# =============================================================================
+
+BASE = Path(
+    "/Users/hongseungmin/Desktop/Lab/Circadian/GlobeM구현본/"
+    "globem-dataset-multi-year-datasets-for-longitudinal-human-behavior-"
+    "modeling-generalization-1.1"
+)
+
 DATASETS = ["INS-W_1", "INS-W_2", "INS-W_3", "INS-W_4"]
-
 SEGMENTS = ["allday", "morning", "afternoon", "evening", "night"]
 
 SLEEP_BASE = [
     "fitbit_sleep_summary_rapids_avgdurationasleepmain",
     "fitbit_sleep_summary_rapids_sumdurationasleepmain",
     "fitbit_sleep_summary_rapids_avgdurationawakemain",
-    "fitbit_sleep_summary_rapids_sumdurationawakemain",
     "fitbit_sleep_summary_rapids_countepisodemain",
     "fitbit_sleep_summary_rapids_avgefficiencymain",
     "fitbit_sleep_summary_rapids_avgdurationinbedmain",
-    "fitbit_sleep_summary_rapids_sumdurationinbedmain",
     "fitbit_sleep_summary_rapids_avgdurationtofallasleepmain",
-    "fitbit_sleep_summary_rapids_sumdurationtofallasleepmain",
-    "fitbit_sleep_summary_rapids_avgdurationafterwakeupmain",
-    "fitbit_sleep_summary_rapids_sumdurationafterwakeupmain",
+    "fitbit_sleep_summary_rapids_firstbedtimemain",
+    "fitbit_sleep_summary_rapids_lastbedtimemain",
+    "fitbit_sleep_summary_rapids_firstwaketimemain",
+    "fitbit_sleep_summary_rapids_lastwaketimemain",
     "fitbit_sleep_intraday_rapids_avgdurationasleepunifiedmain",
     "fitbit_sleep_intraday_rapids_avgdurationawakeunifiedmain",
     "fitbit_sleep_intraday_rapids_countepisodeasleepunifiedmain",
@@ -49,62 +71,69 @@ STEPS_BASE = [
     "fitbit_steps_intraday_rapids_sumsteps",
     "fitbit_steps_intraday_rapids_avgsteps",
     "fitbit_steps_intraday_rapids_stdsteps",
-    "fitbit_steps_intraday_rapids_maxsteps",
-    "fitbit_steps_intraday_rapids_minsteps",
-    "fitbit_steps_summary_rapids_maxsumsteps",
-    "fitbit_steps_summary_rapids_minsumsteps",
-    "fitbit_steps_summary_rapids_avgsumsteps",
-    "fitbit_steps_summary_rapids_stdsumsteps",
+    "fitbit_steps_intraday_rapids_countepisodesedentarybout",
+    "fitbit_steps_intraday_rapids_avgdurationsedentarybout",
+    "fitbit_steps_intraday_rapids_stddurationsedentarybout",
+    "fitbit_steps_intraday_rapids_countepisodeactivebout",
+    "fitbit_steps_intraday_rapids_avgdurationactivebout",
+    "fitbit_steps_intraday_rapids_stddurationactivebout",
 ]
 
-CIRCADIAN_COLS = [
-    "f_cr:fitbit_steps_intraday_rapids_cosinormesor:allday",
-    "f_cr:fitbit_steps_intraday_rapids_cosinoramplitude:allday",
-    "f_cr:fitbit_steps_intraday_rapids_cosinorphaseshift:allday",
-    "f_cr:fitbit_steps_intraday_rapids_IS:allday",
-    "f_cr:fitbit_steps_intraday_rapids_IV:allday",
-]
-
-ROW_MISSING_THRESHOLD = 0.70   # 행 결측률 70% 초과 시 제거
-ADD_MISSING_FLAGS = True        # ① 결측 플래그 피처 추가 여부
+ROW_MISSING_THRESHOLD = 0.70
+ADD_MISSING_FLAGS = True
 
 
-# ══════════════════════════════════════════════════════════════
-# 핵심 변경 ① : person-level imputation
-# ══════════════════════════════════════════════════════════════
-def person_level_impute(df: pd.DataFrame, feature_cols: list) -> pd.DataFrame:
+# =============================================================================
+# Circadian proxy: IS / IV
+# =============================================================================
+
+def compute_IS_IV(row):
     """
-    각 person(subject_id)별로 자신의 이력 중앙값으로 결측 대체.
-    이력이 없어 여전히 NaN이면 전체 중앙값으로 fallback.
+    Compute IS/IV circadian proxies from 4 time-segment step counts.
 
-    기존 방식: df[feature_cols].fillna(df[feature_cols].median())
-    개선 방식: 아래 2단계
+    IS (Interdaily Stability): consistency of daily rhythm (0-1, higher = more stable)
+    IV (Intradaily Variability): fragmentation within a day (higher = more fragmented)
     """
-    df = df.copy()
+    seg_cols = [
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:morning",
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:afternoon",
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:evening",
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:night",
+    ]
+    segs = np.array([row.get(c, np.nan) for c in seg_cols], dtype=float)
 
-    # 단계 1: 개인별 중앙값으로 대체
-    person_medians = (
-        df.groupby("subject_id")[feature_cols]
-        .transform("median")
-    )
-    df[feature_cols] = df[feature_cols].fillna(person_medians)
+    if np.isnan(segs).all():
+        return np.nan, np.nan
 
-    # 단계 2: 여전히 NaN(개인 이력 전부 결측)이면 전체 중앙값으로 fallback
-    global_medians = df[feature_cols].median()
-    df[feature_cols] = df[feature_cols].fillna(global_medians)
+    segs     = np.nan_to_num(segs, nan=0.0)
+    mean_val = np.mean(segs)
 
-    return df
+    if mean_val == 0:
+        return 0.0, 0.0
+
+    IS    = 1.0 / (1.0 + np.std(segs) / (mean_val + 1e-8))
+    diffs = np.diff(segs)
+    IV    = np.mean(diffs ** 2) / (np.var(segs) + 1e-8)
+
+    return IS, IV
 
 
-# ══════════════════════════════════════════════════════════════
-# 핵심 변경 ② : 결측 여부 이진 플래그 피처 추가
-# ══════════════════════════════════════════════════════════════
-def add_missing_flags(df: pd.DataFrame, feature_cols: list) -> tuple:
+# =============================================================================
+# Feature engineering
+# =============================================================================
+
+def build_feature_cols():
+    """Expand base names x segments into full RAPIDS column names."""
+    sleep_cols = [f"f_slp:{base}:{seg}"   for base in SLEEP_BASE for seg in SEGMENTS]
+    steps_cols = [f"f_steps:{base}:{seg}" for base in STEPS_BASE for seg in SEGMENTS]
+    return sleep_cols, steps_cols
+
+
+def add_missing_flags(df, feature_cols):
     """
-    imputation 전에 결측 여부를 이진 플래그(0/1)로 저장.
-    착용하지 않은 것 자체가 우울 신호일 수 있음.
-
-    반환: (flag가 추가된 df, 추가된 flag 컬럼 이름 리스트)
+    [v2] Create binary missing-indicator columns BEFORE imputation.
+    Non-wear events may themselves signal low motivation or depressive behaviour.
+    Indicators that are always 0 (feature never missing) are dropped.
     """
     flag_cols = []
     for col in feature_cols:
@@ -112,87 +141,74 @@ def add_missing_flags(df: pd.DataFrame, feature_cols: list) -> tuple:
         df[flag_name] = df[col].isna().astype(np.int8)
         flag_cols.append(flag_name)
 
-    # 완전히 0인 플래그 컬럼(결측이 한 번도 없는 피처)은 제거 — 노이즈 방지
-    useful_flags = [c for c in flag_cols if df[c].sum() > 0]
-    useless_flags = [c for c in flag_cols if c not in useful_flags]
-    df.drop(columns=useless_flags, inplace=True)
+    useful  = [c for c in flag_cols if df[c].sum() > 0]
+    useless = [c for c in flag_cols if c not in useful]
+    df.drop(columns=useless, inplace=True)
 
-    print(f"  Missing flags 추가: {len(useful_flags)}개 "
-          f"(전체 {len(feature_cols)}개 피처 중 결측 발생한 것만 유지)")
-    return df, useful_flags
-
-
-# ══════════════════════════════════════════════════════════════
-# 데이터 로딩 (기존과 동일)
-# ══════════════════════════════════════════════════════════════
-def build_feature_cols():
-    sleep_cols = [
-        f"f_slp:{base}:{seg}"
-        for base in SLEEP_BASE
-        for seg in SEGMENTS
-    ]
-    steps_cols = [
-        f"f_steps:{base}:{seg}"
-        for base in STEPS_BASE
-        for seg in SEGMENTS
-    ]
-    return sleep_cols, steps_cols
+    print(f"  Missing-indicator features: {len(useful)} "
+          f"(out of {len(feature_cols)} had at least one NaN)")
+    return df, useful
 
 
-def load_dataset(name: str):
-    feat_dir = BASE / name / "FeatureData"
+def person_level_impute(df, feature_cols):
+    """
+    [v2] Two-stage median imputation.
+
+    Stage 1 - Personal median:
+        Fill NaN with that participant's own historical median across their weeks.
+    Stage 2 - Cohort median fallback:
+        If a participant has no observed values at all, fall back to cohort median.
+    """
+    df = df.copy()
+    person_medians = df.groupby("subject_id")[feature_cols].transform("median")
+    df[feature_cols] = df[feature_cols].fillna(person_medians)
+    df[feature_cols] = df[feature_cols].fillna(df[feature_cols].median())
+    return df
+
+
+# =============================================================================
+# Data loading
+# =============================================================================
+
+def load_dataset(name):
+    feat_dir   = BASE / name / "FeatureData"
     label_path = BASE / name / "SurveyData" / "dep_weekly.csv"
 
+    # Labels
     labels = pd.read_csv(label_path)
     labels.columns = labels.columns.str.strip()
-    # dep_weekly 또는 dep 컬럼명 모두 대응
+
     if "dep_weekly" in labels.columns:
         labels = labels.rename(columns={"pid": "subject_id", "dep_weekly": "label"})
     elif "dep" in labels.columns:
         labels = labels.rename(columns={"pid": "subject_id", "dep": "label"})
         labels["label"] = labels["label"].map({True: 1, False: 0, "True": 1, "False": 0})
     else:
-        print(f"  {name}: label 컬럼 없음 — 컬럼 목록: {labels.columns.tolist()}")
+        print(f"  {name}: label column not found")
         return None
+
     labels = labels[["subject_id", "label", "date"]].dropna(subset=["label"])
     labels["label"] = pd.to_numeric(labels["label"], errors="coerce")
     labels = labels.dropna(subset=["label"])
     labels["label"] = (labels["label"] >= 1).astype(int)
 
-    print(f"\nLoading {name}... Labels: {len(labels)} rows, "
-          f"dep=1: {labels['label'].sum()}")
+    print(f"\nLoading {name}...  labels: {len(labels):,}  dep=1: {labels['label'].sum()}")
 
+    # Features
     sleep_cols, steps_cols = build_feature_cols()
-    all_feat_cols = sleep_cols + steps_cols + CIRCADIAN_COLS
-
-    # 피처 파일 수집 — sleep.csv/steps.csv 우선, 없으면 폴더 전체 스캔
-    sleep_path = feat_dir / "sleep.csv"
-    steps_path = feat_dir / "steps.csv"
 
     feat_dfs = []
-    if sleep_path.exists():
-        tmp = pd.read_csv(sleep_path, low_memory=False)
-        tmp.columns = tmp.columns.str.strip()
-        feat_dfs.append(tmp)
-    if steps_path.exists():
-        tmp = pd.read_csv(steps_path, low_memory=False)
-        tmp.columns = tmp.columns.str.strip()
-        feat_dfs.append(tmp)
+    for fname in ["sleep.csv", "steps.csv"]:
+        p = feat_dir / fname
+        if p.exists():
+            tmp = pd.read_csv(p, low_memory=False)
+            tmp.columns = tmp.columns.str.strip()
+            feat_dfs.append(tmp)
 
     if not feat_dfs:
-        for csv_path in sorted(feat_dir.glob("*.csv")):
-            try:
-                tmp = pd.read_csv(csv_path, low_memory=False)
-                tmp.columns = tmp.columns.str.strip()
-                feat_dfs.append(tmp)
-            except Exception:
-                pass
-
-    if not feat_dfs:
-        print(f"  {name}: 피처 파일 없음, 스킵")
+        print(f"  {name}: no feature files found")
         return None
 
-    # pid/date 기준으로 sleep + steps 병합
     feats = feat_dfs[0]
     for extra in feat_dfs[1:]:
         merge_on = [c for c in ["pid", "date"] if c in feats.columns and c in extra.columns]
@@ -200,40 +216,57 @@ def load_dataset(name: str):
             feats = feats.merge(extra, on=merge_on, how="outer")
     feats = feats.rename(columns={"pid": "subject_id"})
 
-    # 존재하는 피처만 사용
+    # IS/IV circadian proxies (computed, not stored in files)
+    seg_step_cols = [
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:morning",
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:afternoon",
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:evening",
+        "f_steps:fitbit_steps_intraday_rapids_sumsteps:night",
+    ]
+    if all(c in feats.columns for c in seg_step_cols):
+        feats[["circ_IS", "circ_IV"]] = feats.apply(
+            lambda r: pd.Series(compute_IS_IV(r)), axis=1
+        )
+        circ_computed = ["circ_IS", "circ_IV"]
+        print(f"  Circadian IS/IV: computed")
+    else:
+        circ_computed = []
+        print(f"  Circadian IS/IV: skipped")
+
     avail_sleep = [c for c in sleep_cols if c in feats.columns]
     avail_steps = [c for c in steps_cols if c in feats.columns]
-    avail_cr    = [c for c in CIRCADIAN_COLS if c in feats.columns]
-    avail_feat  = avail_sleep + avail_steps + avail_cr
+    avail_feat  = avail_sleep + avail_steps + circ_computed
 
-    print(f"  Sleep features available: {len(avail_sleep)}/{len(sleep_cols)}")
-    print(f"  Steps features available: {len(avail_steps)}/{len(steps_cols)}")
-    print(f"  Circadian features available: {len(avail_cr)}/{len(CIRCADIAN_COLS)}")
+    print(f"  Sleep features:    {len(avail_sleep)}/{len(sleep_cols)}")
+    print(f"  Steps features:    {len(avail_steps)}/{len(steps_cols)}")
+    print(f"  Circadian (IS/IV): {len(circ_computed)}")
 
-    # label과 merge
     merge_keys = ["subject_id"] + (["date"] if "date" in feats.columns else [])
-    df = labels.merge(feats[merge_keys + avail_feat].drop_duplicates(subset=merge_keys),
-                      on=merge_keys, how="left")
+    df = labels.merge(
+        feats[merge_keys + avail_feat].drop_duplicates(subset=merge_keys),
+        on=merge_keys, how="left"
+    )
     df["dataset"] = name
 
-    # 행 결측률 필터
-    row_miss = df[avail_feat].isna().mean(axis=1)
+    row_miss     = df[avail_feat].isna().mean(axis=1)
     overall_miss = df[avail_feat].isna().mean().mean()
     print(f"  Overall missing rate: {overall_miss:.1%}")
 
     df = df[row_miss <= ROW_MISSING_THRESHOLD].copy()
-    print(f"  Rows after missing filter: {len(df)} (dep=1: {df['label'].sum()})")
+    print(f"  Rows after filter: {len(df):,}  dep=1: {int(df['label'].sum())}")
 
     return df, avail_feat
 
 
-# ══════════════════════════════════════════════════════════════
-# 메인 파이프라인
-# ══════════════════════════════════════════════════════════════
+# =============================================================================
+# Main pipeline
+# =============================================================================
+
 def main():
-    print("=" * 60)
-    print("GLOBEM Pipeline v2 — Person-level Imputation + Missing Flags")
-    print("=" * 60)
+    print("=" * 62)
+    print("GLOBEM Depression Prediction — Pipeline v2")
+    print("Person-level Imputation + Missing Flags + IS/IV")
+    print("=" * 62)
 
     all_dfs, all_feat_cols = [], None
     for name in DATASETS:
@@ -246,60 +279,51 @@ def main():
             all_feat_cols = feat_cols
 
     if not all_dfs:
-        print("데이터 없음 — BASE 경로 확인 필요")
+        print("No data loaded — check BASE path.")
         return
 
-    df = pd.concat(all_dfs, ignore_index=True)
-    feat_cols = all_feat_cols  # 공통 피처 컬럼
-    print(f"\n전체 병합: {len(df)} rows, dep=1: {df['label'].sum()}")
+    df        = pd.concat(all_dfs, ignore_index=True)
+    feat_cols = all_feat_cols
+    print(f"\nAll cohorts merged: {len(df):,} rows  dep=1: {int(df['label'].sum())}")
 
-    # ── ② 결측 플래그 추가 (imputation 전에 반드시 실행) ──────
+    # Step 1: missing flags (before imputation)
     if ADD_MISSING_FLAGS:
-        print("\n[Step 1] Missing flag 피처 추가 중...")
+        print("\n[Step 1] Creating missing-indicator features ...")
         df, flag_cols = add_missing_flags(df, feat_cols)
     else:
         flag_cols = []
 
-    # ── ① Person-level imputation ─────────────────────────────
-    print("[Step 2] Person-level imputation 적용 중...")
-    before_nan = df[feat_cols].isna().sum().sum()
-    df = person_level_impute(df, feat_cols)
-    after_nan  = df[feat_cols].isna().sum().sum()
-    print(f"  결측 제거: {before_nan:,} → {after_nan:,} (잔여 결측: {after_nan}개)")
+    # Step 2: person-level imputation
+    print("[Step 2] Person-level imputation ...")
+    before_nan = int(df[feat_cols].isna().sum().sum())
+    df         = person_level_impute(df, feat_cols)
+    after_nan  = int(df[feat_cols].isna().sum().sum())
+    print(f"  NaNs: {before_nan:,} -> {after_nan:,}")
 
-    # ── 피처 행렬 구성 ─────────────────────────────────────────
+    # Step 3: feature matrix
     final_feat_cols = feat_cols + flag_cols
-    print(f"\n최종 피처 수: {len(final_feat_cols)} "
-          f"(원본 {len(feat_cols)} + 플래그 {len(flag_cols)})")
+    print(f"\nFinal features: {len(final_feat_cols)} "
+          f"(original {len(feat_cols)} + flags {len(flag_cols)})")
 
-    X = df[final_feat_cols].values.astype(np.float32)
-    y = df["label"].values
+    X      = df[final_feat_cols].values.astype(np.float32)
+    y      = df["label"].values
     groups = df["subject_id"].values
+    X      = StandardScaler().fit_transform(X)
 
-    # StandardScaler (플래그 컬럼은 0/1이지만 스케일링 포함해도 무방)
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
-
-    # ── Bayesian Optimization ─────────────────────────────────
-    print("\n[Step 3] Bayesian Optimization (30 iter)...")
+    # Step 4: Bayesian optimisation
+    print("\n[Step 3] Bayesian Optimisation (10 init + 20 iter) ...")
 
     def xgb_cv(max_depth, learning_rate, subsample,
                 colsample_bytree, min_child_weight, n_estimators):
         params = dict(
-            objective="binary:logistic",
-            eval_metric="auc",
-            max_depth=int(max_depth),
-            learning_rate=learning_rate,
-            subsample=subsample,
-            colsample_bytree=colsample_bytree,
-            min_child_weight=int(min_child_weight),
-            n_estimators=int(n_estimators),
-            scale_pos_weight=(y == 0).sum() / max((y == 1).sum(), 1),
-            random_state=42,
-            verbosity=0,
-            use_label_encoder=False,
+            objective="binary:logistic", eval_metric="auc",
+            max_depth=int(max_depth), learning_rate=learning_rate,
+            subsample=subsample, colsample_bytree=colsample_bytree,
+            min_child_weight=int(min_child_weight), n_estimators=int(n_estimators),
+            scale_pos_weight=(y==0).sum() / max((y==1).sum(), 1),
+            random_state=42, verbosity=0, use_label_encoder=False,
         )
-        cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+        cv     = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
         scores = []
         for tr, val in cv.split(X, y, groups):
             m = XGBClassifier(**params)
@@ -312,24 +336,19 @@ def main():
     optimizer = BayesianOptimization(
         f=xgb_cv,
         pbounds=dict(
-            max_depth=(3, 8),
-            learning_rate=(0.01, 0.3),
-            subsample=(0.6, 1.0),
-            colsample_bytree=(0.6, 1.0),
-            min_child_weight=(1, 10),
-            n_estimators=(50, 300),
+            max_depth=(3, 8), learning_rate=(0.01, 0.3),
+            subsample=(0.6, 1.0), colsample_bytree=(0.6, 1.0),
+            min_child_weight=(1, 10), n_estimators=(50, 300),
         ),
-        random_state=42,
-        verbose=0,
+        random_state=42, verbose=0,
     )
     optimizer.maximize(init_points=10, n_iter=20)
 
     best = optimizer.max["params"]
-    print(f"  Best params: {best}")
-    print(f"  Best CV AUC (Bayesian): {optimizer.max['target']:.4f}")
+    print(f"  Best CV AUC: {optimizer.max['target']:.4f}")
 
-    # ── 최종 5-fold CV 평가 ───────────────────────────────────
-    print("\n[Step 4] Final 5-fold CV AUC with best params:")
+    # Step 5: final 5-fold CV
+    print("\n[Step 4] Final 5-fold CV ...")
     final_params = dict(
         objective="binary:logistic",
         max_depth=int(best["max_depth"]),
@@ -338,16 +357,12 @@ def main():
         colsample_bytree=best["colsample_bytree"],
         min_child_weight=int(best["min_child_weight"]),
         n_estimators=int(best["n_estimators"]),
-        scale_pos_weight=(y == 0).sum() / max((y == 1).sum(), 1),
-        random_state=42,
-        verbosity=0,
-        use_label_encoder=False,
+        scale_pos_weight=(y==0).sum() / max((y==1).sum(), 1),
+        random_state=42, verbosity=0, use_label_encoder=False,
     )
 
-    cv = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    cv        = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
     fold_aucs = []
-    all_preds, all_true = [], []
-
     for fold, (tr, val) in enumerate(cv.split(X, y, groups)):
         m = XGBClassifier(**final_params)
         m.fit(X[tr], y[tr], verbose=False)
@@ -355,66 +370,76 @@ def main():
         if len(np.unique(y[val])) == 2:
             auc = roc_auc_score(y[val], prob)
             fold_aucs.append(auc)
-            print(f"  Fold AUC: {auc:.4f}")
-        all_preds.extend(prob)
-        all_true.extend(y[val])
+            print(f"  Fold {fold+1} AUC: {auc:.4f}")
 
-    mean_auc = np.mean(fold_aucs)
-    std_auc  = np.std(fold_aucs)
-    print(f"\nMean AUC: {mean_auc:.4f} ± {std_auc:.4f}")
-    print(f"\n[v1 기준 AUC: 0.5583]  →  개선폭: {mean_auc - 0.5583:+.4f}")
+    mean_auc = float(np.mean(fold_aucs))
+    std_auc  = float(np.std(fold_aucs))
+    print(f"\n  Mean AUC: {mean_auc:.4f} +/- {std_auc:.4f}")
+    print(f"  vs v1   : {mean_auc - 0.5583:+.4f}  (baseline 0.5583)")
 
-    # ── SHAP 분석 ─────────────────────────────────────────────
-    print("\n[Step 5] SHAP 분석 중...")
-    m_full = XGBClassifier(**final_params)
-    m_full.fit(X, y, verbose=False)
-
-    explainer = shap.TreeExplainer(m_full)
-    shap_vals  = explainer.shap_values(X)
-
-    # 피처 중요도 상위 20개
+    # Step 6: SHAP
+    print("\n[Step 5] SHAP analysis ...")
+    model_full = XGBClassifier(**final_params)
+    model_full.fit(X, y, verbose=False)
+    explainer     = shap.TreeExplainer(model_full)
+    shap_vals     = explainer.shap_values(X)
     mean_abs_shap = np.abs(shap_vals).mean(axis=0)
-    top20_idx = np.argsort(mean_abs_shap)[::-1][:20]
+
+    # 카테고리별 SHAP 기여도 분리
+    flag_idx  = [i for i, c in enumerate(final_feat_cols) if "__missing" in c]
+    circ_idx  = [i for i, c in enumerate(final_feat_cols)
+                 if c in ("circ_IS", "circ_IV") or "bedtime" in c or "waketime" in c]
+    feat_idx  = [i for i, c in enumerate(final_feat_cols)
+                 if i not in flag_idx and i not in circ_idx]
+
+    flag_shap  = mean_abs_shap[flag_idx].sum()
+    circ_shap  = mean_abs_shap[circ_idx].sum()
+    feat_shap  = mean_abs_shap[feat_idx].sum()
+    total_shap = flag_shap + circ_shap + feat_shap
+
+    print(f"\n  Sleep/Activity SHAP   : {feat_shap/total_shap:.1%}")
+    print(f"  Circadian (IS/IV) SHAP: {circ_shap/total_shap:.1%}")
+    print(f"  Missing flag SHAP     : {flag_shap/total_shap:.1%}")
+
+    # Top-20 bar chart
+    top20_idx   = np.argsort(mean_abs_shap)[::-1][:20]
     top20_names = [final_feat_cols[i] for i in top20_idx]
     top20_vals  = mean_abs_shap[top20_idx]
 
-    # Flag vs. non-flag 기여도 분리
-    flag_shap  = mean_abs_shap[[i for i, c in enumerate(final_feat_cols) if "__missing" in c]].sum()
-    feat_shap  = mean_abs_shap[[i for i, c in enumerate(final_feat_cols) if "__missing" not in c]].sum()
-    total_shap = flag_shap + feat_shap
-    print(f"\n  원본 피처 SHAP 기여: {feat_shap/total_shap:.1%}")
-    print(f"  Missing flag SHAP 기여: {flag_shap/total_shap:.1%}")
+    def get_color(name):
+        if "__missing" in name:            return "#E05A5A"  # red    = missing flag
+        if name in ("circ_IS", "circ_IV"): return "#F0A500"  # orange = circadian
+        return "#4C72B0"                                      # blue   = sleep/activity
 
-    # 그래프 저장
     fig, axes = plt.subplots(1, 2, figsize=(18, 8))
 
-    # 좌: beeswarm
     shap.summary_plot(shap_vals, X, feature_names=final_feat_cols,
                       show=False, max_display=20)
     plt.sca(axes[0])
-    plt.title(f"SHAP Beeswarm (Mean AUC={mean_auc:.4f})", fontsize=13)
+    plt.title(f"SHAP Beeswarm  (AUC={mean_auc:.4f})", fontsize=13)
 
-    # 우: bar (상위 20개, flag는 빨간색으로 구분)
-    colors = ["#E05A5A" if "__missing" in n else "#4C72B0" for n in top20_names]
-    axes[1].barh(range(20), top20_vals[::-1], color=colors[::-1])
+    bar_colors = [get_color(n) for n in top20_names]
+    axes[1].barh(range(20), top20_vals[::-1], color=bar_colors[::-1])
     axes[1].set_yticks(range(20))
-    axes[1].set_yticklabels([n.split(":")[-1][:40] for n in top20_names[::-1]], fontsize=9)
+    axes[1].set_yticklabels(
+        [n.split(":")[-1][:40] for n in top20_names[::-1]], fontsize=9
+    )
     axes[1].set_xlabel("Mean |SHAP value|")
-    axes[1].set_title("Top 20 Feature Importance\n(빨간색 = missing flag 피처)", fontsize=13)
-    from matplotlib.patches import Patch
+    axes[1].set_title("Top 20 Feature Importance", fontsize=13)
     axes[1].legend(handles=[
-        Patch(color="#4C72B0", label=f"원본 피처 ({feat_shap/total_shap:.0%})"),
+        Patch(color="#4C72B0", label=f"Sleep/Activity ({feat_shap/total_shap:.0%})"),
+        Patch(color="#F0A500", label=f"Circadian IS/IV ({circ_shap/total_shap:.0%})"),
         Patch(color="#E05A5A", label=f"Missing flag ({flag_shap/total_shap:.0%})"),
     ], loc="lower right")
 
     plt.tight_layout()
     out_path = Path.home() / "Desktop/Lab/Circadian/GlobeM구현본/shap_v2.png"
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"\nSHAP 그래프 저장: {out_path}")
+    print(f"\n  SHAP plot saved -> {out_path}")
 
-    print("\n" + "=" * 60)
-    print(f"완료  |  v1 AUC 0.5583  →  v2 AUC {mean_auc:.4f}")
-    print("=" * 60)
+    print("\n" + "=" * 62)
+    print(f"Done  |  v1 AUC 0.5583  ->  v2 AUC {mean_auc:.4f}")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
