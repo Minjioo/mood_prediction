@@ -39,11 +39,7 @@ from matplotlib.patches import Patch
 # Configuration
 # =============================================================================
 
-BASE = Path(
-    "/Users/hongseungmin/Desktop/Lab/Circadian/GlobeM구현본/"
-    "globem-dataset-multi-year-datasets-for-longitudinal-human-behavior-"
-    "modeling-generalization-1.1"
-)
+BASE = Path(__file__).parent.parent / "data" / "raw"
 
 DATASETS = ["INS-W_1", "INS-W_2", "INS-W_3", "INS-W_4"]
 SEGMENTS = ["allday", "morning", "afternoon", "evening", "night"]
@@ -433,7 +429,8 @@ def main():
     ], loc="lower right")
 
     plt.tight_layout()
-    out_path = Path.home() / "Desktop/Lab/Circadian/GlobeM구현본/shap_v2.png"
+    out_path = Path(__file__).parent.parent / "outputs" / "shap_v2.png"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"\n  SHAP plot saved -> {out_path}")
 
