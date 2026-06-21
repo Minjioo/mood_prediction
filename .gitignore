@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Datasets (대용량, 라이선스 문제로 git에 포함하지 않음 - 각자 다운로드해서 배치)
+globem/data/raw/**/*.csv
+globem/data/raw/**/*.json
+globem/data/raw/**/*.parquet
+globem/data/raw/**/*.zip
