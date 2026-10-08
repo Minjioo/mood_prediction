@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Depresjon
+depresjon/data/
+depresjon/outputs/xgb_model.json
+__pycache__/
+.DS_Store
